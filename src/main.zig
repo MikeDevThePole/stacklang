@@ -86,10 +86,39 @@ const Ast = union(enum) {
     output: struct { x: *Ast },
 };
 
+const ErrorSource = struct {
+    source: []const u8,
+    message: []const u8,
+};
+
 const Parser = struct {
     buf: []const u8,
     idx: usize = 0,
     next_token: ?Token = null,
+    errors: std.ArrayList(ErrorSource) = .empty,
+
+    fn pushErr(self: *Parser, source: []const u8, comptime fmt: []const u8, args: anytype) Error!void {
+        const message = try std.fmt.allocPrint(allocator, fmt, args);
+        try self.errors.append(allocator, ErrorSource{
+            .source = source,
+            .message = message,
+        });
+    }
+
+    fn err(self: *Parser, source: []const u8, comptime fmt: []const u8, args: anytype) Error {
+        try self.pushErr(source, fmt, args);
+        return error.ParseError;
+    }
+
+    fn errNext(self: *Parser, comptime fmt: []const u8, args: anytype) Error {
+        const source = self.next_token.?.source;
+        return self.err(source, fmt, args);
+    }
+
+    fn errContext(self: *Parser, comptime fmt: []const u8, args: anytype) Error!void {
+        const last = self.errors.getLastOrNull() orelse return;
+        try self.pushErr(last.source, fmt, args);
+    }
 
     fn skipByte(self: *Parser) void {
         std.debug.assert(self.idx < self.buf.len);
@@ -183,7 +212,11 @@ const Parser = struct {
 
             '\x00' => .eof,
 
-            else => std.debug.panic("Unknown character: '{f}'", .{std.zig.fmtChar(first)}),
+            else => {
+                const source = self.buf[start..self.idx];
+                self.idx = start;
+                return self.err(source, "Unknown character", .{});
+            },
         };
         const source = self.buf[start..self.idx];
         return Token{ .source = source, .kind = kind };
@@ -207,9 +240,11 @@ const Parser = struct {
         return t.source;
     }
 
-    fn skipWhitespace(self: *Parser) Error!void {
+    fn skipWhitespace(self: *Parser) void {
         while (true) {
-            const t = try self.peek();
+            const t = self.peek() catch {
+                return self.clearErrors();
+            };
             if (t.kind != .whitespace) break;
             self.skip();
         }
@@ -217,51 +252,71 @@ const Parser = struct {
 
     fn atom(self: *Parser) Error!*Ast {
         const t = try self.token();
-        const ast = try allocator.create(Ast);
         switch (t.kind) {
             .@"!", .@"-" => {
-                const inner = try self.atom();
+                const inner = self.atom() catch |e| {
+                    try self.pushErr(t.source, "Expected a value after unary operator", .{});
+                    return e;
+                };
+
+                const ast = try allocator.create(Ast);
                 ast.* = Ast{ .unary = .{ .op = t.kind, .x = inner } };
+                return ast;
             },
-            .ident => ast.* = Ast{ .variable = t.source },
+            .ident => {
+                const ast = try allocator.create(Ast);
+                ast.* = Ast{ .variable = t.source };
+                return ast;
+            },
             .integer => {
                 const value = std.fmt.parseInt(i64, t.source, 10) catch {
-                    return error.ParseError;
+                    return self.err(t.source, "Invalid integer value", .{});
                 };
+
+                const ast = try allocator.create(Ast);
                 ast.* = Ast{ .integer = value };
+                return ast;
             },
             .keyword_output => {
                 const inner = try self.expr();
-                try self.skipWhitespace();
+                self.skipWhitespace();
+
+                const ast = try allocator.create(Ast);
                 ast.* = Ast{ .output = .{ .x = inner } };
+                return ast;
             },
             .@"(" => {
-                allocator.destroy(ast);
-
-                try self.skipWhitespace();
-                const inner = try self.expr();
-                try self.skipWhitespace();
+                self.skipWhitespace();
+                const inner = self.expr() catch |e| {
+                    try self.errContext("Expected an expression within parentheses", .{});
+                    return e;
+                };
+                self.skipWhitespace();
 
                 _ = try self.take(.@")") orelse {
-                    return error.ParseError;
+                    return self.errNext("Missing closing }}", .{});
                 };
 
                 return inner;
             },
-            else => @panic("err"),
+            else => {
+                return self.err(t.source, "Unexpected token", .{});
+            },
         }
-        return ast;
     }
 
     fn exprBp(self: *Parser, min_bp: u8) Error!*Ast {
-        try self.skipWhitespace();
+        self.skipWhitespace();
 
         var lhs = try self.atom();
 
         while (true) {
-            try self.skipWhitespace();
+            self.skipWhitespace();
 
-            const t = try self.peek();
+            const t = self.peek() catch |e| {
+                try self.errContext("Expected a binary operator after an expression", .{});
+                return e;
+            };
             const l_bp: u8, const r_bp: u8 = switch (t.kind) {
                 .@"=", .@"+=", .@"-=", .@"*=", .@"/=", .@"%=", .@"&=", .@"|=", .@"^=", .@"<<=", .@">>=" => .{ 1, 0 }, // right-assoc
                 .@"|" => .{ 2, 3 },
@@ -279,7 +334,10 @@ const Parser = struct {
 
             self.skip();
 
-            const rhs = try self.exprBp(r_bp);
+            const rhs = self.exprBp(r_bp) catch |e| {
+                try self.pushErr(t.source, "Expected a value after a binary operator", .{});
+                return e;
+            };
 
             const ast = try allocator.create(Ast);
             ast.* = Ast{ .binary = .{ .op = t.kind, .a = lhs, .b = rhs } };
@@ -291,6 +349,97 @@ const Parser = struct {
 
     fn expr(self: *Parser) Error!*Ast {
         return self.exprBp(0);
+    }
+
+    fn clearErrors(self: *Parser) void {
+        for (self.errors.items) |e| {
+            allocator.free(e.message);
+        }
+        self.errors.clearRetainingCapacity();
+    }
+
+    fn outputErrorMessages(self: *Parser) void {
+        for (self.errors.items) |e| {
+            const start_idx = @intFromPtr(e.source.ptr) - @intFromPtr(self.buf.ptr);
+
+            var line_count: usize = 1;
+            var line_start: usize = 0;
+            for (self.buf[0..start_idx], 0..) |c, i| {
+                if (c == '\n') {
+                    line_start = i + 1;
+                    line_count += 1;
+                }
+            }
+
+            var linue_number = line_count;
+
+            for (e.source) |c| {
+                if (c == '\n') {
+                    line_count += 1;
+                }
+            }
+
+            const end_idx = start_idx + e.source.len;
+
+            var line_end: usize = end_idx;
+            for (self.buf[line_end..], line_end..) |c, i| {
+                if (c == '\n') {
+                    line_end = i;
+                    break;
+                }
+            } else {
+                line_end = self.buf.len;
+            }
+
+            const max_line_number_width = std.math.log10(line_count) + 1;
+
+            var lines = std.mem.splitScalar(u8, self.buf[line_start..line_end], '\n');
+            while (lines.next()) |line| : (linue_number += 1) {
+                std.debug.print("{}", .{linue_number});
+                for (0..max_line_number_width - (std.math.log10(linue_number) + 1)) |_| {
+                    std.debug.print(" ", .{});
+                }
+                std.debug.print(" | {s}\n", .{line});
+
+                const overlap_start = @max(@intFromPtr(line.ptr), @intFromPtr(e.source.ptr));
+                const overlap_end = @min(@intFromPtr(line.ptr) + line.len, @intFromPtr(e.source.ptr) + e.source.len);
+                if (overlap_start < overlap_end) {
+                    var pad = max_line_number_width + 3;
+                    if (@intFromPtr(line.ptr) < overlap_start) {
+                        pad += overlap_start - @intFromPtr(line.ptr);
+                    }
+                    for (0..pad) |_| {
+                        std.debug.print(" ", .{});
+                    }
+                    for (0..overlap_end - overlap_start) |_| {
+                        std.debug.print("~", .{});
+                    }
+                    std.debug.print("\n", .{});
+                }
+            }
+
+            std.debug.print("error: {s}\n\n", .{e.message});
+        }
+    }
+
+    fn parseProgram(self: *Parser) Error!std.ArrayList(*Ast) {
+        var asts: std.ArrayList(*Ast) = .empty;
+
+        while (true) {
+            self.skipWhitespace();
+            if (try self.take(.eof)) |_| break;
+            const ast = self.expr() catch |e| {
+                try self.errContext("Expected a statement", .{});
+                return e;
+            };
+            try asts.append(allocator, ast);
+        }
+
+        for (asts.items) |ast| {
+            std.debug.print("{}\n", .{ast});
+        }
+
+        return asts;
     }
 };
 
@@ -314,7 +463,6 @@ const VM = struct {
     pub const Error = error{EvalError};
 
     variables: std.StringHashMapUnmanaged(Value) = .empty,
-    // stack: std.ArrayList(Value) = .empty,
     stack: [1024]Value = undefined,
 
     pub fn create() !*VM {
@@ -348,20 +496,6 @@ const VM = struct {
         stack_ptr.* -= 1;
         return self.stack[stack_ptr.*];
     }
-
-    // pub fn push(self: *VM, value: Value) VM.Error!void {
-    //     // std.debug.print("{any}\n", .{self.stack.items});
-    //     self.stack.appendBounded(value) catch {
-    //         return error.EvalError;
-    //     };
-    // }
-
-    // pub fn pop(self: *VM) VM.Error!Value {
-    //     // std.debug.print("{any}\n", .{self.stack.items});
-    //     return self.stack.pop() orelse {
-    //         return error.EvalError;
-    //     };
-    // }
 };
 
 const impl = struct {
@@ -516,17 +650,13 @@ pub fn main() !void {
 
     var parser = Parser{ .buf = code };
 
-    var asts: std.ArrayList(*Ast) = .empty;
-
-    while (true) {
-        try parser.skipWhitespace();
-        if (try parser.take(.eof)) |_| break;
-        try asts.append(allocator, try parser.expr());
-    }
-
-    for (asts.items) |ast| {
-        std.debug.print("{}\n", .{ast});
-    }
+    const asts = parser.parseProgram() catch |e| {
+        if (e == error.ParseError) {
+            parser.outputErrorMessages();
+            return;
+        }
+        return e;
+    };
 
     var compiler = Compiler{};
 
@@ -542,8 +672,6 @@ pub fn main() !void {
         std.debug.print("{}\n", .{expr});
     }
 
-    // const stack = try std.ArrayList(Value).initCapacity(allocator, 1024);
-    // var vm = VM{ .stack = stack };
     const vm = try VM.create();
 
     const inst = compiler.exprs.items.ptr;

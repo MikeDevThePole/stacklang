@@ -16,6 +16,7 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(exe);
 
     exe.use_llvm = true;
+    exe.want_lto = true;
 
     const run_step = b.step("run", "Run the app");
     const run_cmd = b.addRunArtifact(exe);

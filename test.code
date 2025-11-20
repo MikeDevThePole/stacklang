@@ -1,1 +1,41 @@
-output 5541 & 1
+# i = 50
+# a = 0
+# b = 1
+# loop {
+#     curr = a + b
+#     output curr
+#     a = b
+#     b = curr
+#     i -= 1
+#     if i == 0 { break }
+# }
+
+# n = 0
+# loop {
+#     if n > 1 {
+#         is_prime = false
+#         if n == 2 | n == 3 {
+#             is_prime = true
+#         }
+#         if !is_prime & n % 2 != 0 & n % 3 != 0 {
+#             i = 5
+#             loop {
+#                 if n % i == 0 | n % (i + 2) == 0 {
+#                     break
+#                 }
+#                 if i * i > n {
+#                     is_prime = true
+#                     break
+#                 }
+#                 i += 6
+#             }
+#         }
+#         if is_prime {
+#             output n
+#         }
+#     }
+#     n += 1
+# }
+
+i = 1000000000
+loop { i -= 1 if i == 0 { break } }

@@ -6,19 +6,16 @@ const Error = error{
     OutOfMemory,
     ParseError,
     CompileError,
-    UnknownVariable,
-    StackOverflow,
-    StackUnderflow,
-    DivisionByZero,
 };
 
 const TokenKind = enum {
     whitespace,
+    comment,
     ident,
     integer,
 
-    keyword_true,
     keyword_false,
+    keyword_true,
     keyword_if,
     keyword_else,
     keyword_output,
@@ -27,7 +24,8 @@ const TokenKind = enum {
     @"}",
     @"(",
     @")",
-    @"=>",
+
+    @"~",
 
     @"=",
     @"+=",
@@ -65,8 +63,8 @@ const TokenKind = enum {
 
 const keywords =
     std.StaticStringMap(TokenKind).initComptime(.{
-        .{ "true", .keyword_true },
         .{ "false", .keyword_false },
+        .{ "true", .keyword_true },
         .{ "if", .keyword_if },
         .{ "else", .keyword_else },
         .{ "output", .keyword_output },
@@ -84,6 +82,7 @@ const Ast = union(enum) {
     binary: struct { op: TokenKind, a: *Ast, b: *Ast },
     if_else_cond: struct { true: *Ast, false: *Ast },
     output: struct { x: *Ast },
+    if_else: struct { cond: *Ast, true: []*Ast, false: []*Ast },
 };
 
 const ErrorSource = struct {
@@ -161,6 +160,15 @@ const Parser = struct {
                 }
                 break :b .whitespace;
             },
+            '#' => {
+                while (true) {
+                    switch (self.nextByte()) {
+                        '\n', '\x00' => break,
+                        else => {},
+                    }
+                }
+                break :b .comment;
+            },
             '_', 'a'...'z', 'A'...'Z' => {
                 while (true) {
                     const c = self.peekByte();
@@ -182,7 +190,7 @@ const Parser = struct {
                 break :b .integer;
             },
 
-            '=' => if (self.takeByte('=')) .@"==" else if (self.takeByte('>')) .@"=>" else .@"=",
+            '=' => if (self.takeByte('=')) .@"==" else .@"=",
             '!' => if (self.takeByte('=')) .@"!=" else .@"!",
             '<' => if (self.takeByte('<'))
                 if (self.takeByte('=')) .@"<<=" else .@"<<"
@@ -204,6 +212,7 @@ const Parser = struct {
             '&' => if (self.takeByte('=')) .@"&=" else .@"&",
             '|' => if (self.takeByte('=')) .@"|=" else .@"|",
             '^' => if (self.takeByte('=')) .@"^=" else .@"^",
+            '~' => .@"~",
 
             '{' => .@"{",
             '}' => .@"}",
@@ -245,45 +254,69 @@ const Parser = struct {
             const t = self.peek() catch {
                 return self.clearErrors();
             };
-            if (t.kind != .whitespace) break;
+            switch (t.kind) {
+                .whitespace, .comment => {},
+                else => break,
+            }
             self.skip();
         }
+    }
+
+    fn allocAst(self: *Parser, value: Ast) Error!*Ast {
+        _ = self;
+        const ast = try allocator.create(Ast);
+        ast.* = value;
+        return ast;
     }
 
     fn atom(self: *Parser) Error!*Ast {
         const t = try self.token();
         switch (t.kind) {
-            .@"!", .@"-" => {
+            .@"!", .@"-", .@"~" => {
                 const inner = self.atom() catch |e| {
                     try self.pushErr(t.source, "Expected a value after unary operator", .{});
                     return e;
                 };
 
-                const ast = try allocator.create(Ast);
-                ast.* = Ast{ .unary = .{ .op = t.kind, .x = inner } };
-                return ast;
+                return self.allocAst(Ast{ .unary = .{ .op = t.kind, .x = inner } });
             },
-            .ident => {
-                const ast = try allocator.create(Ast);
-                ast.* = Ast{ .variable = t.source };
-                return ast;
-            },
+            .ident => return self.allocAst(Ast{ .variable = t.source }),
+            .keyword_false => return self.allocAst(Ast{ .integer = 0 }),
+            .keyword_true => return self.allocAst(Ast{ .integer = 1 }),
             .integer => {
                 const value = std.fmt.parseInt(i64, t.source, 10) catch {
                     return self.err(t.source, "Invalid integer value", .{});
                 };
 
-                const ast = try allocator.create(Ast);
-                ast.* = Ast{ .integer = value };
-                return ast;
+                return self.allocAst(Ast{ .integer = value });
             },
             .keyword_output => {
                 const inner = try self.expr();
                 self.skipWhitespace();
 
-                const ast = try allocator.create(Ast);
-                ast.* = Ast{ .output = .{ .x = inner } };
-                return ast;
+                return self.allocAst(Ast{ .output = .{ .x = inner } });
+            },
+            .keyword_if => {
+                const cond = try self.expr();
+                self.skipWhitespace();
+                _ = try self.take(.@"{") orelse {
+                    return self.errNext("Missing opening {{", .{});
+                };
+                const true_block = try self.parseBlock();
+                self.skipWhitespace();
+                var false_block: []*Ast = &.{};
+                if (try self.take(.keyword_else)) |_| {
+                    self.skipWhitespace();
+                    _ = try self.take(.@"{") orelse {
+                        return self.errNext("Missing opening {{", .{});
+                    };
+                    false_block = try self.parseBlock();
+                }
+                return self.allocAst(Ast{ .if_else = .{
+                    .cond = cond,
+                    .true = true_block,
+                    .false = false_block,
+                } });
             },
             .@"(" => {
                 self.skipWhitespace();
@@ -294,14 +327,12 @@ const Parser = struct {
                 self.skipWhitespace();
 
                 _ = try self.take(.@")") orelse {
-                    return self.errNext("Missing closing }}", .{});
+                    return self.errNext("Missing closing )", .{});
                 };
 
                 return inner;
             },
-            else => {
-                return self.err(t.source, "Unexpected token", .{});
-            },
+            else => return self.err(t.source, "Unexpected token", .{}),
         }
     }
 
@@ -339,9 +370,11 @@ const Parser = struct {
                 return e;
             };
 
-            const ast = try allocator.create(Ast);
-            ast.* = Ast{ .binary = .{ .op = t.kind, .a = lhs, .b = rhs } };
-            lhs = ast;
+            lhs = try self.allocAst(Ast{ .binary = .{
+                .op = t.kind,
+                .a = lhs,
+                .b = rhs,
+            } });
         }
 
         return lhs;
@@ -349,6 +382,22 @@ const Parser = struct {
 
     fn expr(self: *Parser) Error!*Ast {
         return self.exprBp(0);
+    }
+
+    fn parseBlock(self: *Parser) Error![]*Ast {
+        var asts: std.ArrayList(*Ast) = .empty;
+
+        while (true) {
+            self.skipWhitespace();
+            if (try self.take(.@"}")) |_| break;
+            const ast = self.expr() catch |e| {
+                try self.errContext("Expected a statement", .{});
+                return e;
+            };
+            try asts.append(allocator, ast);
+        }
+
+        return try asts.toOwnedSlice(allocator);
     }
 
     fn clearErrors(self: *Parser) void {
@@ -561,11 +610,214 @@ const impl = struct {
         return @call(.always_tail, ops[1].eval, .{ vm, sp, ops + 1 });
     }
 
+    fn bitand(vm: *VM, stack_ptr: usize, ops: [*]const Expr) VM.Error!void {
+        var sp = stack_ptr;
+        const b = vm.pop(&sp);
+        const a = vm.pop(&sp);
+        vm.push(&sp, a & b);
+        return @call(.always_tail, ops[1].eval, .{ vm, sp, ops + 1 });
+    }
+
+    fn bitor(vm: *VM, stack_ptr: usize, ops: [*]const Expr) VM.Error!void {
+        var sp = stack_ptr;
+        const b = vm.pop(&sp);
+        const a = vm.pop(&sp);
+        vm.push(&sp, a | b);
+        return @call(.always_tail, ops[1].eval, .{ vm, sp, ops + 1 });
+    }
+
+    fn bitxor(vm: *VM, stack_ptr: usize, ops: [*]const Expr) VM.Error!void {
+        var sp = stack_ptr;
+        const b = vm.pop(&sp);
+        const a = vm.pop(&sp);
+        vm.push(&sp, a ^ b);
+        return @call(.always_tail, ops[1].eval, .{ vm, sp, ops + 1 });
+    }
+
+    fn shl(vm: *VM, stack_ptr: usize, ops: [*]const Expr) VM.Error!void {
+        var sp = stack_ptr;
+        const b = vm.pop(&sp);
+        const a = vm.pop(&sp);
+        vm.push(&sp, a << @truncate(@as(u64, @bitCast(b))));
+        return @call(.always_tail, ops[1].eval, .{ vm, sp, ops + 1 });
+    }
+
+    fn shr(vm: *VM, stack_ptr: usize, ops: [*]const Expr) VM.Error!void {
+        var sp = stack_ptr;
+        const b = vm.pop(&sp);
+        const a = vm.pop(&sp);
+        vm.push(&sp, a >> @truncate(@as(u64, @bitCast(b))));
+        return @call(.always_tail, ops[1].eval, .{ vm, sp, ops + 1 });
+    }
+
+    fn set_add(vm: *VM, stack_ptr: usize, ops: [*]const Expr) VM.Error!void {
+        var sp = stack_ptr;
+        const a = try vm.get(ops[0].data.variable);
+        const b = vm.pop(&sp);
+        try vm.set(ops[0].data.variable, a +% b);
+        return @call(.always_tail, ops[1].eval, .{ vm, sp, ops + 1 });
+    }
+
+    fn set_sub(vm: *VM, stack_ptr: usize, ops: [*]const Expr) VM.Error!void {
+        var sp = stack_ptr;
+        const a = try vm.get(ops[0].data.variable);
+        const b = vm.pop(&sp);
+        try vm.set(ops[0].data.variable, a -% b);
+        return @call(.always_tail, ops[1].eval, .{ vm, sp, ops + 1 });
+    }
+
+    fn set_mul(vm: *VM, stack_ptr: usize, ops: [*]const Expr) VM.Error!void {
+        var sp = stack_ptr;
+        const a = try vm.get(ops[0].data.variable);
+        const b = vm.pop(&sp);
+        try vm.set(ops[0].data.variable, a *% b);
+        return @call(.always_tail, ops[1].eval, .{ vm, sp, ops + 1 });
+    }
+
+    fn set_div(vm: *VM, stack_ptr: usize, ops: [*]const Expr) VM.Error!void {
+        var sp = stack_ptr;
+        const a = try vm.get(ops[0].data.variable);
+        const b = vm.pop(&sp);
+        if (b == 0) return error.EvalError;
+        try vm.set(ops[0].data.variable, @divTrunc(a, b));
+        return @call(.always_tail, ops[1].eval, .{ vm, sp, ops + 1 });
+    }
+
+    fn set_rem(vm: *VM, stack_ptr: usize, ops: [*]const Expr) VM.Error!void {
+        var sp = stack_ptr;
+        const a = try vm.get(ops[0].data.variable);
+        const b = vm.pop(&sp);
+        if (b == 0) return error.EvalError;
+        try vm.set(ops[0].data.variable, @rem(a, b));
+        return @call(.always_tail, ops[1].eval, .{ vm, sp, ops + 1 });
+    }
+
+    fn set_bitand(vm: *VM, stack_ptr: usize, ops: [*]const Expr) VM.Error!void {
+        var sp = stack_ptr;
+        const a = try vm.get(ops[0].data.variable);
+        const b = vm.pop(&sp);
+        try vm.set(ops[0].data.variable, a & b);
+        return @call(.always_tail, ops[1].eval, .{ vm, sp, ops + 1 });
+    }
+
+    fn set_bitor(vm: *VM, stack_ptr: usize, ops: [*]const Expr) VM.Error!void {
+        var sp = stack_ptr;
+        const a = try vm.get(ops[0].data.variable);
+        const b = vm.pop(&sp);
+        try vm.set(ops[0].data.variable, a | b);
+        return @call(.always_tail, ops[1].eval, .{ vm, sp, ops + 1 });
+    }
+
+    fn set_bitxor(vm: *VM, stack_ptr: usize, ops: [*]const Expr) VM.Error!void {
+        var sp = stack_ptr;
+        const a = try vm.get(ops[0].data.variable);
+        const b = vm.pop(&sp);
+        try vm.set(ops[0].data.variable, a ^ b);
+        return @call(.always_tail, ops[1].eval, .{ vm, sp, ops + 1 });
+    }
+
+    fn set_shl(vm: *VM, stack_ptr: usize, ops: [*]const Expr) VM.Error!void {
+        var sp = stack_ptr;
+        const a = try vm.get(ops[0].data.variable);
+        const b = vm.pop(&sp);
+        try vm.set(ops[0].data.variable, a << @truncate(@as(u64, @bitCast(b))));
+        return @call(.always_tail, ops[1].eval, .{ vm, sp, ops + 1 });
+    }
+
+    fn set_shr(vm: *VM, stack_ptr: usize, ops: [*]const Expr) VM.Error!void {
+        var sp = stack_ptr;
+        const a = try vm.get(ops[0].data.variable);
+        const b = vm.pop(&sp);
+        try vm.set(ops[0].data.variable, a >> @truncate(@as(u64, @bitCast(b))));
+        return @call(.always_tail, ops[1].eval, .{ vm, sp, ops + 1 });
+    }
+
+    fn eq(vm: *VM, stack_ptr: usize, ops: [*]const Expr) VM.Error!void {
+        var sp = stack_ptr;
+        const b = vm.pop(&sp);
+        const a = vm.pop(&sp);
+        vm.push(&sp, @intFromBool(a == b));
+        return @call(.always_tail, ops[1].eval, .{ vm, sp, ops + 1 });
+    }
+
+    fn ne(vm: *VM, stack_ptr: usize, ops: [*]const Expr) VM.Error!void {
+        var sp = stack_ptr;
+        const b = vm.pop(&sp);
+        const a = vm.pop(&sp);
+        vm.push(&sp, @intFromBool(a != b));
+        return @call(.always_tail, ops[1].eval, .{ vm, sp, ops + 1 });
+    }
+
+    fn lt(vm: *VM, stack_ptr: usize, ops: [*]const Expr) VM.Error!void {
+        var sp = stack_ptr;
+        const b = vm.pop(&sp);
+        const a = vm.pop(&sp);
+        vm.push(&sp, @intFromBool(a < b));
+        return @call(.always_tail, ops[1].eval, .{ vm, sp, ops + 1 });
+    }
+
+    fn le(vm: *VM, stack_ptr: usize, ops: [*]const Expr) VM.Error!void {
+        var sp = stack_ptr;
+        const b = vm.pop(&sp);
+        const a = vm.pop(&sp);
+        vm.push(&sp, @intFromBool(a <= b));
+        return @call(.always_tail, ops[1].eval, .{ vm, sp, ops + 1 });
+    }
+
+    fn gt(vm: *VM, stack_ptr: usize, ops: [*]const Expr) VM.Error!void {
+        var sp = stack_ptr;
+        const b = vm.pop(&sp);
+        const a = vm.pop(&sp);
+        vm.push(&sp, @intFromBool(a > b));
+        return @call(.always_tail, ops[1].eval, .{ vm, sp, ops + 1 });
+    }
+
+    fn ge(vm: *VM, stack_ptr: usize, ops: [*]const Expr) VM.Error!void {
+        var sp = stack_ptr;
+        const b = vm.pop(&sp);
+        const a = vm.pop(&sp);
+        vm.push(&sp, @intFromBool(a >= b));
+        return @call(.always_tail, ops[1].eval, .{ vm, sp, ops + 1 });
+    }
+
+    fn eqz(vm: *VM, stack_ptr: usize, ops: [*]const Expr) VM.Error!void {
+        var sp = stack_ptr;
+        const x = vm.pop(&sp);
+        vm.push(&sp, @intFromBool(x == 0));
+        return @call(.always_tail, ops[1].eval, .{ vm, sp, ops + 1 });
+    }
+
+    fn neg(vm: *VM, stack_ptr: usize, ops: [*]const Expr) VM.Error!void {
+        var sp = stack_ptr;
+        const x = vm.pop(&sp);
+        vm.push(&sp, -%x);
+        return @call(.always_tail, ops[1].eval, .{ vm, sp, ops + 1 });
+    }
+
+    fn not(vm: *VM, stack_ptr: usize, ops: [*]const Expr) VM.Error!void {
+        var sp = stack_ptr;
+        const x = vm.pop(&sp);
+        vm.push(&sp, ~x);
+        return @call(.always_tail, ops[1].eval, .{ vm, sp, ops + 1 });
+    }
+
     fn output(vm: *VM, stack_ptr: usize, ops: [*]const Expr) VM.Error!void {
         var sp = stack_ptr;
         const value = vm.pop(&sp);
         std.debug.print("debug: {}\n", .{value});
         return @call(.always_tail, ops[1].eval, .{ vm, sp, ops + 1 });
+    }
+
+    fn jump_if_not(vm: *VM, stack_ptr: usize, ops: [*]const Expr) VM.Error!void {
+        var sp = stack_ptr;
+        const x = vm.pop(&sp);
+        const next_op: [*]const Expr = @ptrFromInt(@intFromPtr(ops) +% if (x == 0) ops[0].data.offset else @sizeOf(Expr));
+        return @call(.always_tail, next_op[0].eval, .{ vm, sp, next_op });
+    }
+
+    fn jump(vm: *VM, stack_ptr: usize, ops: [*]const Expr) VM.Error!void {
+        const next_op: [*]const Expr = @ptrFromInt(@intFromPtr(ops) +% ops[0].data.offset);
+        return @call(.always_tail, next_op[0].eval, .{ vm, stack_ptr, next_op });
     }
 
     fn stop(vm: *VM, stack_ptr: usize, ops: [*]const Expr) VM.Error!void {
@@ -594,6 +846,19 @@ const Compiler = struct {
                 });
                 return;
             },
+            .unary => |info| {
+                try self.expr(info.x);
+                const eval: EvalFn = switch (info.op) {
+                    .@"!" => impl.eqz,
+                    .@"-" => impl.neg,
+                    .@"~" => impl.not,
+                    else => @panic("err"),
+                };
+                try self.exprs.append(allocator, Expr{
+                    .eval = eval,
+                });
+                return;
+            },
             .binary => |info| {
                 try self.expr(info.a);
                 try self.expr(info.b);
@@ -603,6 +868,16 @@ const Compiler = struct {
                     .@"*" => impl.mul,
                     .@"/" => impl.div,
                     .@"%" => impl.rem,
+                    .@"&" => impl.bitand,
+                    .@"|" => impl.bitor,
+                    .@"^" => impl.bitxor,
+                    .@"<<" => impl.shl,
+                    .@">>" => impl.shr,
+                    .@"!=" => impl.ne,
+                    .@"<" => impl.lt,
+                    .@"<=" => impl.le,
+                    .@">" => impl.gt,
+                    .@">=" => impl.ge,
                     else => @panic("err"),
                 };
                 try self.exprs.append(allocator, Expr{
@@ -618,24 +893,66 @@ const Compiler = struct {
     pub fn stmt(self: *Compiler, ast: *const Ast) Error!void {
         switch (ast.*) {
             .binary => |info| {
-                switch (info.op) {
-                    .@"=" => {
-                        if (info.a.* != .variable) return error.CompileError;
-                        try self.expr(info.b);
-                        try self.exprs.append(allocator, Expr{
-                            .eval = impl.set,
-                            .data = .{ .variable = info.a.variable },
-                        });
-                        return;
-                    },
+                const eval: EvalFn = switch (info.op) {
+                    .@"=" => impl.set,
+                    .@"+=" => impl.set_add,
+                    .@"-=" => impl.set_sub,
+                    .@"*=" => impl.set_mul,
+                    .@"/=" => impl.set_div,
+                    .@"%=" => impl.set_rem,
+                    .@"&=" => impl.set_bitand,
+                    .@"|=" => impl.set_bitor,
+                    .@"^=" => impl.set_bitxor,
+                    .@"<<=" => impl.set_shl,
+                    .@">>=" => impl.set_shr,
                     else => @panic("err"),
-                }
+                };
+
+                if (info.a.* != .variable) return error.CompileError;
+                try self.expr(info.b);
+                try self.exprs.append(allocator, Expr{
+                    .eval = eval,
+                    .data = .{ .variable = info.a.variable },
+                });
+                return;
             },
             .output => |info| {
                 try self.expr(info.x);
                 try self.exprs.append(allocator, Expr{
                     .eval = impl.output,
                 });
+                return;
+            },
+            .if_else => |info| {
+                try self.expr(info.cond);
+
+                // Jump to the false condition body if the condition is false and continue as is otherwise
+                const true_start_expr = self.exprs.items.len;
+                var skip_true_expr = try self.exprs.addOne(allocator);
+                skip_true_expr.eval = impl.jump_if_not;
+
+                for (info.true) |inner| {
+                    try self.stmt(inner);
+                }
+
+                const has_false = info.false.len > 0;
+                const true_insts = self.exprs.items.len - true_start_expr + @intFromBool(has_false);
+                skip_true_expr.data = .{ .offset = @sizeOf(Expr) * true_insts };
+
+                // At the end of the true condition body skip the false condition body if it exists
+                if (has_false) {
+                    const false_start_expr = self.exprs.items.len;
+                    var skip_false_expr = try self.exprs.addOne(allocator);
+                    skip_false_expr.eval = impl.jump;
+
+                    for (info.false) |inner| {
+                        try self.stmt(inner);
+                    }
+
+                    const false_insts = self.exprs.items.len - false_start_expr;
+                    skip_false_expr.data = .{ .offset = @sizeOf(Expr) * false_insts };
+                }
+
                 return;
             },
             else => {},
@@ -646,7 +963,11 @@ const Compiler = struct {
 
 pub fn main() !void {
     const cwd = std.fs.cwd();
-    const code = try cwd.readFileAlloc(allocator, "test.code", std.math.maxInt(usize));
+    const code = try cwd.readFileAlloc(
+        allocator,
+        "test.code",
+        std.math.maxInt(usize),
+    );
 
     var parser = Parser{ .buf = code };
 
